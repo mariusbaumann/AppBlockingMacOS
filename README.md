@@ -13,6 +13,9 @@ the signing attributes of all apps and import the result into Intune.
 - macOS 27 or later
 - No Xcode or Command Line Tools needed (uses `codesign`, `file`, `openssl`,
   `plutil` and `log`, all part of macOS)
+- Reading the log (`--log`, log check in allow mode) needs admin rights. If
+  the current user can't read the log store, the script asks for the sudo
+  password.
 
 ## Usage
 
@@ -36,6 +39,10 @@ chmod +x create_app_policy.sh
    - `AllowedBinaries`: only allowed apps run. You can allow all Apple-signed
      binaries (`*APPLE*`), set `AlwaysAllowManagedApps`, and either scan the
      whole system or enter single apps.
+     Afterwards the script can check the log of the last 8 hours for blocked
+     binaries that aren't in the policy yet, and add all, none or selected ones.
+     Binaries inside an app bundle are added as the whole (outermost) bundle.
+     Translocated or deleted apps are skipped.
    - `DeniedBinaries`: everything runs except the apps you enter.
 3. **Output.** Import the JSON in *Intune > Devices > Configuration > Import
    policy*. When you enter single apps, the script also prints the values

@@ -12,7 +12,9 @@ Creates an Intune Settings Catalog policy (JSON) for the macOS 27 DDM
 app configuration (AllowedBinaries / DeniedBinaries) from the apps on this Mac.
 
   (no argument)      Interactive: choose CDHash yes/no, allow or deny mode,
-                     full system scan or single apps. Writes a JSON file for
+                     full system scan or single apps. In allow mode it can
+                     also add binaries blocked in the last 8h (from the log).
+                     Writes a JSON file for
                      Intune > Devices > Configuration > Import policy.
   <path>             Only show the values of one app or binary
                      (Path Prefix, Signing ID, Signing State, Team ID, CDHash
@@ -133,6 +135,7 @@ bundle_execs() {
 process() { # .app/.systemextension or single binary
   local item=$1 exe a
   [ -d "$item" ] || [ -n "$(archs "$item")" ] || return # scripts etc.
+  PROCESSED+=("$item")
   echo "- $item"
   if [ "$USE_HASH" = 1 ]; then
     if [ -d "$item" ]; then bundle_execs "$item"; else echo "$item"; fi | while IFS= read -r exe; do
@@ -174,6 +177,50 @@ scan_items() {
   done
 }
 
+# Blocks by managedeventsd in the unified log. Translocation paths
+# (apps run directly from DMG/Downloads) have random UUIDs -> normalized.
+PRED='subsystem == "com.apple.devicemanagementclient.managedeventsd" AND category == "LaunchPolicy" AND eventMessage CONTAINS "DENIED"'
+NORM='/DENIED exec:/ { p=$0; sub(/.*, path /,"",p); sub(/.*\/AppTranslocation\/[^\/]*\/d\//,"[AppTranslocation]/",p); t=substr($1" "$2,1,19)'
+# Reading the log store needs admin rights -> fall back to sudo. Sets LOG.
+log_access() {
+  LOG=log
+  [ "$EUID" -eq 0 ] && return
+  log show --last 1s 2>&1 >/dev/null | grep -q "not permitted" || return 0
+  echo "Reading the log needs admin rights - sudo password required." >&2
+  sudo -v || { warn "no access to the log"; return 1; }
+  LOG="sudo log"
+}
+log_blocked() { # unique blocked paths of the last 8h
+  $LOG show --last 8h --style compact --predicate "$PRED" | awk "$NORM"'; if (!s[p]++) print p }'
+}
+
+in_list() { local x=$1 y; shift; for y; do [ "$x" = "$y" ] && return 0; done; return 1; }
+
+# Allow mode: offer binaries blocked in the last 8h that aren't in the policy yet.
+add_from_log() {
+  local p item new=() all
+  log_access || { warn "log check skipped"; return; }
+  echo "Reading log ..."
+  while IFS= read -r p; do
+    case $p in "[AppTranslocation]"*) warn "skipped (translocated, move the app to /Applications first): $p"; continue ;; esac
+    case $p in *.app/*) item="${p%%.app/*}.app" ;; *) item=$p ;; esac # outermost bundle
+    [ -e "$item" ] || { warn "skipped (no longer exists): $item"; continue; }
+    in_list "$item" "${PROCESSED[@]}" "${new[@]}" && continue
+    new+=("$item")
+  done < <(log_blocked)
+  [ ${#new[@]} -eq 0 ] && { echo "No additional blocked binaries found."; return; }
+  echo "Blocked binaries not yet in the policy:"
+  for i in "${!new[@]}"; do echo "  $((i+1))) ${new[$i]}"; done
+  ask "Add them? a) all  n) none  s) select individually" a
+  all=$REPLY
+  for item in "${new[@]}"; do
+    case $all in
+      [aA]*) process "$item" ;;
+      [sS]*) ask "Add $item? (y/n)" y; is_yes "$REPLY" && process "$item" ;;
+    esac
+  done
+}
+
 ask_app() { # -> APP (existing path)
   while :; do
     # without -r: "Citrix\ Workspace.app" (tab/drag & drop) becomes "Citrix Workspace.app"
@@ -189,22 +236,20 @@ case $1 in -h|--help) usage; exit 0 ;; esac
 
 TMP=$(mktemp); trap 'rm -f "$TMP" "$TMP".c*' EXIT
 
-# --log: blocks by managedeventsd from the unified log. Translocation paths
-# (apps run directly from DMG/Downloads) have random UUIDs -> normalized.
+# --log: show blocked apps
 if [ "$1" = --log ]; then
-  PRED='subsystem == "com.apple.devicemanagementclient.managedeventsd" AND category == "LaunchPolicy" AND eventMessage CONTAINS "DENIED"'
-  NORM='/DENIED exec:/ { p=$0; sub(/.*, path /,"",p); sub(/.*\/AppTranslocation\/[^\/]*\/d\//,"[AppTranslocation]/",p); t=substr($1" "$2,1,19)'
+  log_access || exit 1
   case $2 in
     -l) MODE=l ;; -p) MODE=p ;;
     *) echo "  1) Live"; echo "  2) Last 8 hours"; ask "Choice" 1; [ "$REPLY" = 2 ] && MODE=p || MODE=l ;;
   esac
   if [ "$MODE" = p ]; then
     echo "Blocked in the last 8h (last seen | count | path):"
-    log show --last 8h --style compact --predicate "$PRED" | awk "$NORM"'; n[p]++; l[p]=t }
+    $LOG show --last 8h --style compact --predicate "$PRED" | awk "$NORM"'; n[p]++; l[p]=t }
       END { for (p in n) printf "%s  %4dx  %s\n", l[p], n[p], p }' | sort
   else
     echo "Live - blocked apps (Ctrl+C to stop), repeats are counted:"
-    log stream --style compact --predicate "$PRED" | awk "$NORM"'; n[p]++
+    $LOG stream --style compact --predicate "$PRED" | awk "$NORM"'; n[p]++
       if (n[p] == 1) printf "%s  BLOCKED       %s\n", t, p
       else printf "%s  again (%dx)   %s\n", t, n[p], p
       fflush() }'
@@ -265,6 +310,9 @@ if [ "$REPLY" = 1 ]; then
     SINGLE=1
     while :; do ask_app; process "$APP"; ask "Another app? (y/n)" n; is_yes "$REPLY" || break; done
   fi
+  echo
+  ask "Also check the log (last 8h) for blocked binaries? (y/n)" n
+  is_yes "$REPLY" && add_from_log
 else
   KIND=deniedbinaries
   SINGLE=1
