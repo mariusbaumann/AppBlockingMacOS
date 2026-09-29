@@ -1,0 +1,4 @@
+# generated/exported policies (may contain hostnames, app lists, customer data)
+*.json
+anforderungen.md
+.DS_Store
